@@ -1,0 +1,48 @@
+[project]
+name = "civicpulse-backend"
+version = "1.0.0"
+description = "CivicPulse municipal complaint triage API"
+requires-python = ">=3.11"
+# Runtime dependencies are pinned in requirements.txt so the Docker layer
+# cache can install them before the source is copied.
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["alembic/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "BLE", "SIM", "RUF"]
+ignore = ["S101", "RUF012", "B008"]
+
+[tool.ruff.lint.isort]
+known-third-party = ["alembic"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "BLE"]
+"app/seed.py" = ["E501"]  # one realistic complaint per line reads better than wrapped data
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+exclude = ["alembic/"]
+warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = ["integration: needs PostgreSQL and Redis (DATABASE_URL / REDIS_URL)"]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/export_openapi.py"]
+
+[tool.coverage.report]
+fail_under = 65
+show_missing = true
