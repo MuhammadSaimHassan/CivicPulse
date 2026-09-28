@@ -21,6 +21,11 @@ COPY src ./src
 RUN npx tsc --noEmit && npx vite build
 
 FROM ${NGINX_IMAGE} AS runtime
+
+# Patch OS packages that already have a published fix. Trivy gate: libexpat
+# CVE-2026-93990 (HIGH), installed 2.8.4-r0, fixed in 2.8.5-r0.
+RUN apk upgrade --no-cache libexpat
+
 # Run as the image's unprivileged `nginx` user (uid 101): listen on 8080, keep
 # the pid file, temp dirs, rendered config and runtime config.js under /tmp so
 # the rest of the filesystem can be read-only.
