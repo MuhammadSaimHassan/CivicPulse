@@ -1,0 +1,20 @@
+# Non-secret configuration. Anything that is a password or key lives in secret.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: civicpulse-config
+data:
+  APP_ENV: "kubernetes"
+  LOG_LEVEL: "INFO"
+  POSTGRES_DB: "civicpulse"
+  POSTGRES_USER: "civicpulse"
+  TRIAGE_PROVIDER: "rules"
+  LLM_VENDOR: "groq"
+  LLM_BASE_URL: "https://api.groq.com/openai/v1"
+  LLM_MODEL: "llama-3.1-8b-instant"
+  RATE_LIMIT_PER_WINDOW: "10"
+  RATE_LIMIT_WINDOW_SECONDS: "60"
+  SHUTDOWN_GRACE_SECONDS: "20"
+  # Frontend runtime config (nginx renders these at container start).
+  BACKEND_UPSTREAM: "http://backend:8000"
+  APP_ENVIRONMENT: "kubernetes"

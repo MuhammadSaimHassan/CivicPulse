@@ -1,0 +1,29 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60     # of resources.requests.cpu — no request, no HPA
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # scale down slowly: flapping is expensive
+      policies:
+        - { type: Pods, value: 1, periodSeconds: 60 }
+    scaleUp:
+      stabilizationWindowSeconds: 0     # scale up immediately: users are waiting
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 15 }
+        - { type: Pods, value: 4, periodSeconds: 15 }
+      selectPolicy: Max

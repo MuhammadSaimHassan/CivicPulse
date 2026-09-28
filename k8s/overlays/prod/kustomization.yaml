@@ -1,0 +1,44 @@
+# Production overlay, deployed by .github/workflows/cd.yml.
+#
+# The image reference below is a placeholder that CI replaces with the
+# immutable digest of the image it just built, scanned and signed:
+#   kustomize edit set image civicpulse-backend=ghcr.io/<owner>/civicpulse-backend@sha256:...
+# `:latest` is pushed for convenience but is never deployed. To answer "what
+# is production running?", read the digest from `kubectl get deploy backend
+# -o jsonpath='{..image}'` and match it to the commit in the GHCR package page
+# (tags: <git sha>).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+images:
+  - name: civicpulse-backend
+    newName: ghcr.io/OWNER/civicpulse-backend
+    newTag: SET-BY-CI-TO-A-COMMIT-SHA
+  - name: civicpulse-frontend
+    newName: ghcr.io/OWNER/civicpulse-frontend
+    newTag: SET-BY-CI-TO-A-COMMIT-SHA
+configMapGenerator:
+  - name: civicpulse-config
+    behavior: merge
+    literals:
+      - APP_ENV=production
+      - APP_ENVIRONMENT=production
+      - TRIAGE_PROVIDER=llm
+secretGenerator:
+  # Written by cd.yml from GitHub Secrets; gitignored; never committed.
+  - name: civicpulse-secrets
+    behavior: replace
+    envs: [secrets.env]
+generatorOptions:
+  disableNameSuffixHash: true
+patches:
+  # Pull from GHCR with a secret the deploy job creates from GITHUB_TOKEN.
+  - target: { kind: Deployment, name: "backend|frontend" }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/imagePullSecrets
+        value: [{ name: ghcr-pull }]
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
