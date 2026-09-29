@@ -1,0 +1,13 @@
+.git
+node_modules
+dist
+coverage
+tests
+*.md
+.env
+.env.*
+Dockerfile
+.dockerignore
+.eslintcache
+eslint.config.js
+src/api/schema.check.d.ts
