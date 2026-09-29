@@ -1,0 +1,22 @@
+# One host, two routes. /api goes straight to the backend Service (the backend
+# serves its routes under /api, so no path rewriting is needed); everything
+# else goes to the frontend.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: civicpulse
+  labels: { app.kubernetes.io/part-of: civicpulse }
+spec:
+  ingressClassName: traefik       # k3d/k3s ship Traefik; overlays can change this
+  rules:
+    - host: civicpulse.localhost
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service: { name: backend, port: { number: 8000 } }
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: frontend, port: { number: 8080 } }

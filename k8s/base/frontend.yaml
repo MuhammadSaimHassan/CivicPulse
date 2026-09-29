@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  labels: { app.kubernetes.io/name: frontend }
+spec:
+  type: ClusterIP
+  selector: { app.kubernetes.io/name: frontend }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  labels: { app.kubernetes.io/name: frontend }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels: { app.kubernetes.io/name: frontend }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: frontend }
+    spec:
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: frontend
+          image: civicpulse-frontend
+          ports:
+            - { name: http, containerPort: 8080 }
+          env:
+            # Runtime configuration: the SAME image as Compose, configured here.
+            - name: BACKEND_UPSTREAM
+              valueFrom: { configMapKeyRef: { name: civicpulse-config, key: BACKEND_UPSTREAM } }
+            - name: APP_ENVIRONMENT
+              valueFrom: { configMapKeyRef: { name: civicpulse-config, key: APP_ENVIRONMENT } }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits: { cpu: 200m, memory: 64Mi }
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            failureThreshold: 15
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 5
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "5"] }
+          volumeMounts:
+            # The only writable paths: rendered nginx config, temp files, config.js.
+            - { name: nginx-tmp, mountPath: /tmp/nginx }
+            - { name: runtime, mountPath: /tmp/runtime }
+            - { name: cache, mountPath: /var/cache/nginx }
+      volumes:
+        - { name: nginx-tmp, emptyDir: {} }
+        - { name: runtime, emptyDir: {} }
+        - { name: cache, emptyDir: {} }
