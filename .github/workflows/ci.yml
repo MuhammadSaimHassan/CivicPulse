@@ -1,0 +1,261 @@
+# CI — on every pull request to main and every push to dev.
+# Also called by cd.yml and release.yml (workflow_call) so the merged result
+# is tested with exactly the same jobs before anything is published.
+#
+# Actions are pinned to full commit SHAs (the tag is in the trailing comment):
+# a tag can be moved to point at different code; a SHA cannot.
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [dev]
+  workflow_call: {}
+
+# Least privilege: CI only reads the repository. It publishes nothing.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "22"
+
+jobs:
+  lint-and-type:
+    name: lint-and-type
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Backend — ruff + mypy
+        working-directory: backend
+        run: |
+          pip install -r requirements-dev.txt
+          ruff check .
+          ruff format --check .
+          mypy app
+      - name: Frontend — eslint + tsc
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npx eslint .
+          npx tsc --noEmit
+      - name: API contract — frontend types match the backend's OpenAPI schema
+        run: |
+          (cd backend && python -m app.export_openapi ../frontend/openapi.json)
+          git diff --exit-code frontend/openapi.json || { echo "::error::openapi.json is stale: run 'python -m app.export_openapi ../frontend/openapi.json' in backend/ and 'npm run gen:api' in frontend/"; exit 1; }
+          (cd frontend && npm run check:api)
+
+  test-backend:
+    name: test-backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16.15-alpine3.24
+        env:
+          POSTGRES_DB: civicpulse_test
+          POSTGRES_USER: civicpulse
+          POSTGRES_PASSWORD: ci-only-password # throwaway service container, not a credential
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U civicpulse" --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:7.4.11-alpine3.21
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      # Deterministic by design: CI never calls a live model.
+      TRIAGE_PROVIDER: simulated
+      TEST_DATABASE_URL: postgresql+psycopg://civicpulse:ci-only-password@localhost:5432/civicpulse_test
+      TEST_REDIS_URL: redis://localhost:6379/15
+      # Unreachable Postgres/Redis must FAIL the job, never silently skip tests.
+      REQUIRE_INTEGRATION: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - name: pytest (coverage >= 65% on app/)
+        working-directory: backend
+        run: |
+          pip install -r requirements-dev.txt
+          python -m pytest --cov=app --cov-report=term --cov-report=xml --cov-fail-under=65
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: backend-coverage
+          path: backend/coverage.xml
+          if-no-files-found: ignore
+
+  test-frontend:
+    name: test-frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Vitest
+        working-directory: frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+
+  build:
+    name: build (${{ matrix.component }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        component: [backend, frontend]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      # Build only. A pull request must never publish an artifact.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.component }}
+          push: false
+          tags: civicpulse-${{ matrix.component }}:ci
+          outputs: type=docker,dest=${{ runner.temp }}/${{ matrix.component }}.tar
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+      - name: Report image size
+        run: |
+          docker load -i "${{ runner.temp }}/${{ matrix.component }}.tar"
+          docker image ls civicpulse-${{ matrix.component }}:ci --format '{{.Repository}}:{{.Tag}} {{.Size}}' | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-${{ matrix.component }}
+          path: ${{ runner.temp }}/${{ matrix.component }}.tar
+          retention-days: 1
+
+  scan:
+    name: scan (${{ matrix.component }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [backend, frontend]
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image-${{ matrix.component }}
+          path: ${{ runner.temp }}
+      # Fail on HIGH/CRITICAL vulnerabilities that HAVE a fixed version: those
+      # are the ones we can act on by bumping a base image or a dependency.
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          input: ${{ runner.temp }}/${{ matrix.component }}.tar
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+  manifests:
+    name: manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install kustomize + kubeconform (pinned)
+        run: |
+          curl -sSL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.5.0/kustomize_v5.5.0_linux_amd64.tar.gz | tar xz -C /usr/local/bin kustomize
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz -C /usr/local/bin kubeconform
+      - name: kustomize build | kubeconform  (catches a broken manifest in seconds, not on the cluster)
+        run: |
+          for overlay in dev prod; do
+            # The real secrets.env is gitignored; validate with the committed example.
+            cp k8s/overlays/$overlay/secrets.env.example k8s/overlays/$overlay/secrets.env
+            echo "== $overlay"
+            kustomize build k8s/overlays/$overlay | kubeconform -strict -summary \
+              -kubernetes-version 1.31.0 \
+              -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+          done
+
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: docker compose up (the real stack, from a clean clone)
+        run: |
+          cp .env.example .env
+          docker compose up -d --build --wait --wait-timeout 300
+          docker compose ps
+      - name: /ready through the backend
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8000/ready && break
+            sleep 2
+          done
+          curl -sf http://localhost:8000/ready
+      - name: POST a complaint through nginx, GET it back, assert the category
+        run: |
+          set -euo pipefail
+          body='{"text":"Burst water main flooding Street 12 since fajr, water entering ground floors","location":"Street 12, G-9/2, Islamabad"}'
+          created=$(curl -sf -X POST http://localhost:8080/api/complaints -H 'Content-Type: application/json' -d "$body")
+          echo "$created"
+          id=$(echo "$created" | jq -r .id)
+          test "$(echo "$created" | jq -r .category)" = water
+          test "$(echo "$created" | jq -r .priority)" = high
+          fetched=$(curl -sf "http://localhost:8080/api/complaints/$id")
+          test "$(echo "$fetched" | jq -r .category)" = water
+          echo "created and fetched $id"
+      - name: X-Cache goes MISS -> HIT
+        run: |
+          set -euo pipefail
+          first=$(curl -s -D - -o /dev/null http://localhost:8080/api/stats | tr -d '\r' | awk -F': ' 'tolower($1)=="x-cache"{print $2}')
+          second=$(curl -s -D - -o /dev/null http://localhost:8080/api/stats | tr -d '\r' | awk -F': ' 'tolower($1)=="x-cache"{print $2}')
+          echo "first=$first second=$second"
+          test "$first" = MISS && test "$second" = HIT
+      - name: Network segmentation — the frontend cannot reach the database
+        run: |
+          # Must fail for the RIGHT reason: the name does not even resolve on the
+          # frontend's network (not "tool missing", not "connection refused").
+          out=$(docker compose exec -T frontend wget -q -T 3 -O /dev/null http://postgres:5432/ 2>&1 || true)
+          echo "$out"
+          grep -q "bad address" <<<"$out" || { echo "::error::frontend could resolve postgres — segmentation is broken"; exit 1; }
+          echo "frontend -> postgres: name not resolvable, as designed"
+      - name: Persistence — rows survive down/up
+        run: |
+          set -euo pipefail
+          count() { docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "SELECT count(*) FROM complaints"'; }
+          before=$(count)
+          docker compose down
+          docker compose up -d --wait --wait-timeout 300
+          after=$(count)
+          echo "before=$before after=$after"
+          test "$before" = "$after"
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
