@@ -1,0 +1,29 @@
+# OPTIONAL (bonus: GitOps). Argo CD reconciles the cluster from this repository.
+# Install Argo CD, then:  kubectl apply -f k8s/argocd/application.yaml
+# With this in place, the deploy step becomes "commit the new image digest to
+# k8s/overlays/prod/kustomization.yaml"; Argo CD notices and applies it, and a
+# rollback is `git revert`. The Secret must still be created out-of-band (or
+# with Sealed Secrets / External Secrets) — it is never in Git — so for GitOps
+# delete the secretGenerator block from k8s/overlays/prod/kustomization.yaml
+# (Argo CD cannot read the gitignored secrets.env) and create the Secret once
+# with: kubectl -n civicpulse create secret generic civicpulse-secrets --from-env-file=...
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: civicpulse
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/MuhammadSaimHassan/CivicPulse.git
+    targetRevision: main
+    path: k8s/overlays/prod
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: civicpulse
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
