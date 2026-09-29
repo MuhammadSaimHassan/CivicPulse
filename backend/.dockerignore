@@ -1,0 +1,24 @@
+# Keep the build context to what the image needs. Everything listed here would
+# otherwise be sent to the daemon on every build (and could leak into a layer).
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+coverage.xml
+htmlcov
+tests
+Dockerfile
+.dockerignore
+requirements-dev.txt
+openapi.json
+*.md
