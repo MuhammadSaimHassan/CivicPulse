@@ -1,0 +1,27 @@
+# Secrets — never committed. .env.example is the template.
+.env
+.env.*
+!.env.example
+k8s/overlays/*/secrets.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Node
+node_modules/
+dist/
+frontend/src/api/schema.check.d.ts
+
+# Tooling / load-test output
+load/results/
+*.log
+.DS_Store
