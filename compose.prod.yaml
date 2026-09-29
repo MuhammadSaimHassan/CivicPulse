@@ -1,0 +1,156 @@
+# CivicPulse — production-style stack from PUBLISHED images.
+#
+#   IMAGE_TAG=<git sha> docker compose -f compose.prod.yaml up -d --wait
+#
+# Differences from compose.yaml, each deliberate:
+#   * image: ...:${IMAGE_TAG} and no build key anywhere — run exactly what CI
+#     built, scanned and pushed. IMAGE_TAG is required: there is no default,
+#     so nobody deploys :latest by accident.
+#   * no bind mounts — the code is the image, not someone's working copy.
+#   * backend runs app.server (graceful SIGTERM), not uvicorn --reload.
+#   * no published database or cache port. Only the frontend is reachable.
+
+name: civicpulse-prod
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-backend-env: &backend-env
+  APP_ENV: production
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?set in .env}:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/${POSTGRES_DB:?set in .env}
+  REDIS_URL: redis://:${REDIS_PASSWORD:?set in .env}@redis:6379/0
+  TRIAGE_PROVIDER: ${TRIAGE_PROVIDER:-llm}
+  LLM_VENDOR: ${LLM_VENDOR:-groq}
+  LLM_BASE_URL: ${LLM_BASE_URL:-https://api.groq.com/openai/v1}
+  LLM_MODEL: ${LLM_MODEL:-llama-3.1-8b-instant}
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  OLLAMA_BASE_URL: http://ollama:11434
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:1b}
+  RATE_LIMIT_PER_WINDOW: ${RATE_LIMIT_PER_WINDOW:-10}
+  RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+
+x-backend-image: &backend-image
+  image: ghcr.io/${GHCR_OWNER:?set in .env}/civicpulse-backend:${IMAGE_TAG:?set IMAGE_TAG to a commit SHA}
+
+services:
+  postgres:
+    image: postgres:16.15-alpine3.24
+    <<: *restart
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+
+  redis:
+    image: redis:7.4.11-alpine3.21
+    <<: *restart
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--requirepass", "${REDIS_PASSWORD:?set in .env}"]
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?set in .env}
+    volumes:
+      - redisdata:/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+  migrate:
+    <<: *backend-image
+    command: ["python", "-m", "app.migrate", "--seed"]
+    environment: *backend-env
+    networks: [internal]
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+  backend:
+    <<: [*backend-image, *restart]
+    environment: *backend-env
+    stop_grace_period: 30s   # > SHUTDOWN_GRACE_SECONDS (20 s): let in-flight requests drain
+    networks: [edge, internal]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+
+  frontend:
+    image: ghcr.io/${GHCR_OWNER:?set in .env}/civicpulse-frontend:${IMAGE_TAG:?set IMAGE_TAG to a commit SHA}
+    <<: *restart
+    environment:
+      BACKEND_UPSTREAM: http://backend:8000
+      APP_ENVIRONMENT: production
+    ports:
+      - "${FRONTEND_PORT:-8080}:8080"
+    networks: [edge]
+    depends_on:
+      backend: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 64M }
+
+  ollama:
+    profiles: [ollama]
+    image: ollama/ollama:0.34.4
+    <<: *restart
+    volumes:
+      - ollama_models:/root/.ollama
+    networks: [internal, ollama_egress]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 3G }
+
+networks:
+  edge:
+    driver: bridge
+  internal:
+    driver: bridge
+    internal: true
+  ollama_egress:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  ollama_models:
