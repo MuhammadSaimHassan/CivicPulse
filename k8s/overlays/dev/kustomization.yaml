@@ -1,0 +1,33 @@
+# Local k3d cluster. Images are built locally and imported into the cluster
+# (`k3d image import`), tagged :dev — never :latest.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+images:
+  - name: civicpulse-backend
+    newName: civicpulse-backend
+    newTag: dev
+  - name: civicpulse-frontend
+    newName: civicpulse-frontend
+    newTag: dev
+configMapGenerator:
+  - name: civicpulse-config
+    behavior: merge
+    literals:
+      - APP_ENV=k8s-dev
+      - APP_ENVIRONMENT=k8s-dev
+secretGenerator:
+  # secrets.env is gitignored. scripts/k8s-up.sh writes it from your .env;
+  # secrets.env.example shows the keys.
+  - name: civicpulse-secrets
+    behavior: replace
+    envs: [secrets.env]
+generatorOptions:
+  disableNameSuffixHash: true
+patches:
+  - target: { kind: Deployment, name: "backend|frontend" }
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent

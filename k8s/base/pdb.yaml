@@ -1,0 +1,10 @@
+# Voluntary disruptions (node drain, cluster upgrade) may never take the
+# backend below one running pod.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: backend
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: backend }

@@ -1,0 +1,33 @@
+# The Kubernetes equivalent of Compose's `internal: true` network: only
+# backend pods may open connections to PostgreSQL and Redis. A compromised
+# frontend pod has no route to the data. (Enforced by k3s's built-in
+# network-policy controller; kind needs a CNI such as Calico for enforcement.)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-from-backend-only
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: postgres }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: backend }
+      ports:
+        - { protocol: TCP, port: 5432 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-from-backend-only
+spec:
+  podSelector:
+    matchLabels: { app.kubernetes.io/name: redis }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app.kubernetes.io/name: backend }
+      ports:
+        - { protocol: TCP, port: 6379 }

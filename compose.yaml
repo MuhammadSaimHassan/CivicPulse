@@ -1,0 +1,236 @@
+# CivicPulse — development stack.   Quickstart:  make up   (or: cp .env.example .env && docker compose up -d --build --wait)
+#
+# Networks
+#   edge      frontend <-> backend. Normal bridge: has a route to the internet.
+#   internal  backend <-> postgres <-> redis (<-> ollama). internal: true = no
+#             route out, and nothing on `edge` alone can reach it.
+#   The backend is the ONLY service on both. So `docker compose exec frontend
+#   ping postgres` fails — by design: the internet-facing container has no
+#   route to the data. The backend's outbound calls to Groq/Gemini leave via
+#   its `edge` interface (see docs/ENGINEERING-NOTES.md, Q7).
+#
+# Volumes
+#   pgdata         PostgreSQL data directory — the durable one.
+#   redisdata      Redis AOF. See ENGINEERING-NOTES for why a cache gets a volume.
+#   ollama_models  ~800 MB of model weights, so `up` does not re-download them.
+#   + a DEV-ONLY bind mount of backend/app for hot reload (absent from compose.prod.yaml).
+
+name: civicpulse
+
+x-restart: &restart
+  restart: unless-stopped
+
+x-backend-env: &backend-env
+  APP_ENV: dev
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?set in .env}:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/${POSTGRES_DB:?set in .env}
+  REDIS_URL: redis://:${REDIS_PASSWORD:?set in .env}@redis:6379/0
+  TRIAGE_PROVIDER: ${TRIAGE_PROVIDER:-rules}
+  LLM_VENDOR: ${LLM_VENDOR:-groq}
+  LLM_BASE_URL: ${LLM_BASE_URL:-https://api.groq.com/openai/v1}
+  LLM_MODEL: ${LLM_MODEL:-llama-3.1-8b-instant}
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  OLLAMA_BASE_URL: http://ollama:11434
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:1b}
+  RATE_LIMIT_PER_WINDOW: ${RATE_LIMIT_PER_WINDOW:-10}
+  RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+
+services:
+  postgres:
+    image: postgres:16.15-alpine3.24
+    <<: *restart
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?set in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+
+  redis:
+    image: redis:7.4.11-alpine3.21
+    <<: *restart
+    # AOF on, fsync every second: survive a restart, lose at most ~1 s of counters.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--requirepass", "${REDIS_PASSWORD:?set in .env}"]
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?set in .env}
+    volumes:
+      - redisdata:/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+  # One-shot: apply Alembic migrations (under an advisory lock) and load the
+  # idempotent seed. Schema changes never happen in application startup code.
+  migrate:
+    build: ./backend
+    image: civicpulse-backend:dev
+    command: ["python", "-m", "app.migrate", "--seed"]
+    environment: *backend-env
+    networks: [internal]
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+  backend:
+    build: ./backend
+    image: civicpulse-backend:dev
+    <<: *restart
+    # Dev only: uvicorn --reload watching the bind-mounted source below.
+    command: ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000",
+              "--reload", "--reload-dir", "/app/app", "--proxy-headers", "--forwarded-allow-ips", "*"]
+    environment: *backend-env
+    volumes:
+      # DEV-ONLY bind mount: edit code on the host, the server reloads. Right
+      # here because the feedback loop is the point of a dev stack; wrong in
+      # compose.prod.yaml because production must run exactly the image that
+      # CI tested and scanned, not whatever is on someone's disk.
+      - ./backend/app:/app/app:ro
+    ports:
+      - "127.0.0.1:8000:8000"   # dev convenience: /docs, curl. Not in prod.
+    networks: [edge, internal]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    deploy:
+      resources:
+        limits: { cpus: "1.0", memory: 512M }
+
+  frontend:
+    build: ./frontend
+    image: civicpulse-frontend:dev
+    <<: *restart
+    environment:
+      BACKEND_UPSTREAM: http://backend:8000
+      APP_ENVIRONMENT: compose-dev
+    ports:
+      - "${FRONTEND_PORT:-8080}:8080"
+    networks: [edge]
+    depends_on:
+      backend: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 64M }
+
+  # --- Optional: fully offline triage.  docker compose --profile ollama up -d
+  ollama:
+    profiles: [ollama]
+    image: ollama/ollama:0.34.4
+    <<: *restart
+    volumes:
+      - ollama_models:/root/.ollama
+    # internal: reachable by the backend. ollama_egress: lets the server
+    # download model weights once; the frontend is on neither.
+    networks: [internal, ollama_egress]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits: { cpus: "2.0", memory: 3G }
+
+  ollama-pull:
+    profiles: [ollama]
+    image: ollama/ollama:0.34.4
+    entrypoint: ["ollama", "pull", "${OLLAMA_MODEL:-llama3.2:1b}"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    networks: [internal]
+    depends_on:
+      ollama: { condition: service_healthy }
+    restart: "no"
+    deploy:
+      resources:
+        limits: { cpus: "0.25", memory: 128M }
+
+  # --- Optional: metrics.  docker compose --profile observability up -d
+  prometheus:
+    profiles: [observability]
+    image: prom/prometheus:v3.15.0
+    <<: *restart
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+    networks: [edge]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+  grafana:
+    profiles: [observability]
+    image: grafana/grafana:13.2.2
+    <<: *restart
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set in .env}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks: [edge]
+    depends_on:
+      prometheus: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits: { cpus: "0.5", memory: 256M }
+
+networks:
+  edge:
+    driver: bridge
+  internal:
+    driver: bridge
+    internal: true
+  ollama_egress:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  ollama_models:

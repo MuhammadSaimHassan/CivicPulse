@@ -1,0 +1,51 @@
+# Rendered by the nginx image's entrypoint with envsubst at CONTAINER START.
+# ${BACKEND_UPSTREAM} is therefore runtime configuration: the same image
+# proxies to http://backend:8000 in Compose and in Kubernetes, or anywhere else.
+server {
+    listen 8080;
+    server_name _;
+    root /usr/share/nginx/html;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Referrer-Policy strict-origin-when-cross-origin always;
+    add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; connect-src 'self'" always;
+    # Chosen per-path by a map in nginx.conf. Deliberately NO add_header inside
+    # any location below: in nginx, one add_header in a location silently drops
+    # every add_header inherited from the server block (including the ones above).
+    add_header Cache-Control $cache_control always;
+
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # Same-origin API: the browser calls /api/..., nginx forwards it. No CORS
+    # needed, no backend URL in the JavaScript bundle.
+    location /api/ {
+        proxy_pass ${BACKEND_UPSTREAM};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Request-ID $req_id;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        # > 2 x 10 s triage timeout + retry jitter, so nginx never cuts off a
+        # request the backend is still legitimately working on.
+        proxy_read_timeout 35s;
+    }
+
+    location = /config.js {
+        alias /tmp/runtime/config.js;
+        default_type application/javascript;
+    }
+
+    location /assets/ {
+        try_files $uri =404;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
